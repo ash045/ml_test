@@ -6,7 +6,7 @@ data:
   root: data
   raw_dir: data/raw
   processed_dir: data/processed
-  symbol: "SOL_USD"             # CSV name without .csv
+  symbol: "SOL_USD"
   tz: "UTC"
   timestamp_col: "timestamp"
   price_col: "close"
@@ -14,8 +14,8 @@ data:
   fee_bps: 7.0
   spread_bps: 2.0
   slippage_alpha: 0.5
-  slippage_beta_trades: 0.5          # slippage penalty when trades < ADT
-  adv_window: 240                    # window for ADT/ADV
+  slippage_beta_trades: 0.5
+  adv_window: 240
 
 bars:
   timeframes: ["1min","5min","15min","60min"]
@@ -27,15 +27,15 @@ bars:
 
 features:
   windows:
-    returns: [1, 5, 15, 30, 60, 90]    # added horizon-matched momentum
-    vol:     [15, 30, 60, 90, 240]     # added 30 & 90 to match horizons
-    trades:  [15, 30, 60, 90, 240]     # if trades windows are used by your pipeline
+    returns: [1, 5, 15, 30, 60, 90]
+    vol:     [15, 30, 60, 90, 240]
+    trades:  [15, 30, 60, 90, 240]
   fractional_diff:
     enabled: true
-    d_candidates: [0.2, 0.4]           # tighten a bit; avoid over-frac & noise
+    d_candidates: [0.2, 0.4]
     stationarity_test: "adf"
   denoise:
-    ema_windows: [3, 5, 15]            # add 15 to catch horizon-scale drift
+    ema_windows: [3, 5, 15]
   prune:
     corr_threshold: 0.95
 
@@ -53,7 +53,7 @@ labeling:
 validation:
   folds: 5
   min_train_bars: 5000
-  embargo_minutes: "auto"            # equals H if "auto"
+  embargo_minutes: "auto"
   nested_tuning: true
   final_test_fraction: 0.1
 
@@ -105,7 +105,7 @@ execution:
   spread_bps: 1.0
   slippage_alpha: 0.5
   adt_window: 60
-  mapper_combine: union  # was "intersect"  # intersect | threshold_only | mapper_only | union
+  mapper_combine: union
   liquidity_gate:
     enabled: true
     window: 60
@@ -135,7 +135,7 @@ monitoring:
   brier_drift_tol: 0.05
 
 threshold_opt:
-  holdout_frac: 0.8           # fine to keep
+  holdout_frac: 0.8
   apply_execution_mapping: true
-  min_trades_train: 100       # was 100; keep or lower to 50 if needed
-  min_trades_holdout: 5       # was 20 → relax so it doesn’t drop to zero
+  min_trades_train: 100
+  min_trades_holdout: 5
