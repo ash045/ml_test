@@ -64,6 +64,11 @@ def main(cfg_path: str, timeframe: str = "1min"):
     df["y"] = lab_multi[col_y]
     df["t_end"] = lab_multi[col_tend]
 
+    # Note: We postpone computation of sample weights until after realized returns are computed.
+
+    # --- Realized returns for PRIMARY horizon ---
+    df = add_event_realized_returns(df, price_col=cfg["data"]["price_col"])
+
     # --- Sample weights: incorporate uniqueness AND magnitude of realized returns ---
     # When enabled, compute concurrency-based uniqueness weights (1/overlap) and scale them
     # by the absolute realized return of the primary event.  This encourages the model
@@ -76,9 +81,6 @@ def main(cfg_path: str, timeframe: str = "1min"):
         df["w"] = uniq * abs_ret
     else:
         df["w"] = 1.0
-
-    # --- Realized returns for PRIMARY horizon ---
-    df = add_event_realized_returns(df, price_col=cfg["data"]["price_col"])
 
     # --- EXTRA realized returns for ADDITIONAL horizons ---
     if len(horizons) > 1:
