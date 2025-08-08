@@ -539,7 +539,22 @@ def train_oof_models(df: pd.DataFrame, cfg: Dict, artifact_dir: str) -> pd.DataF
 
         # Apply calibration on outer validation predictions
         if calib_f is not None:
-            pv_va_cal = calib_f(pv_va)
+            # For isotonic regression, use transform; for Platt scaling (logistic regression),
+            # use predict_proba on the reshaped probabilities.  Otherwise, if calib_f
+            # is a callable, invoke it directly.  If anything fails, fall back to
+            # the uncalibrated probabilities.
+            try:
+                from sklearn.isotonic import IsotonicRegression
+                if isinstance(calib_f, IsotonicRegression):
+                    pv_va_cal = calib_f.transform(pv_va)
+                elif hasattr(calib_f, "predict_proba"):
+                    pv_va_cal = calib_f.predict_proba(pv_va.reshape(-1, 1))[:, 1]
+                elif callable(calib_f):
+                    pv_va_cal = calib_f(pv_va)
+                else:
+                    pv_va_cal = pv_va
+            except Exception:
+                pv_va_cal = pv_va
         else:
             pv_va_cal = pv_va
 
