@@ -64,9 +64,16 @@ def main(cfg_path: str, timeframe: str = "1min"):
     df["y"] = lab_multi[col_y]
     df["t_end"] = lab_multi[col_tend]
 
-    # --- Sample weights based on concurrency (primary t_end) ---
+    # --- Sample weights: incorporate uniqueness AND magnitude of realized returns ---
+    # When enabled, compute concurrency-based uniqueness weights (1/overlap) and scale them
+    # by the absolute realized return of the primary event.  This encourages the model
+    # to pay more attention to larger moves while still downweighting overlapping events.
     if cfg["labeling"].get("use_uniqueness_weights", False):
-        df["w"] = compute_concurrency_weights(df["t_end"])
+        # First, compute uniqueness (inverse concurrency)
+        uniq = compute_concurrency_weights(df["t_end"])
+        # Next, take absolute realized returns; NaN returns are treated as zero
+        abs_ret = df.get("ev_ret").abs().fillna(0.0)
+        df["w"] = uniq * abs_ret
     else:
         df["w"] = 1.0
 
