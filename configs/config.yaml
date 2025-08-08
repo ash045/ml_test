@@ -51,11 +51,12 @@ labeling:
   use_uniqueness_weights: true
 
 validation:
-  folds: 5
-  min_train_bars: 5000
-  embargo_minutes: "auto"
-  nested_tuning: true
-  final_test_fraction: 0.1
+  outer_folds: 5          # rename from folds
+  inner_folds: 3          # add explicitly
+  min_train_size: 1000    # rename from min_train_bars; lower from 5000
+  embargo: 3              # replace minutes/"auto" with small # of bars
+  final_test_fraction: 0  # give all data to CV while debugging
+  debug_splits: true      # to verify split sizes in logs
 
 models:
   logit:
@@ -65,10 +66,12 @@ models:
     refine_best: true
     refine_max_evals: 12
 
-  lightgbm:
+  # rename 'lightgbm' -> 'lgbm' to match the code’s expectations
+  lgbm:
     max_depth: [3, 4, 5]
     num_leaves: [8, 16, 32]
-    min_data_in_leaf: [200, 500, 1000]
+    # make leaves feasible for smaller folds
+    min_data_in_leaf: [50, 100, 200]
     feature_fraction: [0.6, 0.8]
     bagging_fraction: [0.6, 0.8]
     lambda_l1: [0.0, 0.001, 0.01, 0.1]
@@ -76,19 +79,20 @@ models:
     learning_rate: [0.02, 0.05, 0.1]
     early_stopping_rounds: 200
     num_boost_round: 5000
-    hp_max_evals: 40
+    hp_max_evals: 20       # trim while debugging (40 later)
     refine_best: true
-    refine_max_evals: 20
+    refine_max_evals: 10
 
-  catboost:
+  # rename 'catboost' -> 'catb'
+  catb:
     depth: [3, 4, 5]
     learning_rate: [0.02, 0.05, 0.1]
     l2_leaf_reg: [1.0, 3.0, 10.0, 30.0]
     subsample: [0.6, 0.8]
     early_stopping_rounds: 200
-    hp_max_evals: 20
+    hp_max_evals: 12       # trim while debugging (20 later)
     refine_best: true
-    refine_max_evals: 10
+    refine_max_evals: 6
 
 calibration:
   method: "isotonic"

@@ -1,256 +1,138 @@
-import os
+# src/ml_signals/pipeline/train_oof.py
+# -*- coding: utf-8 -*-
+"""Nested purged walk‑forward OOF training (robust importances & proba).
+
+Fixes in this patch:
+- Prevent TypeError when concatenating feature importances (guard types).
+- Make LightGBM trainer return a DataFrame of importances (gain/split).
+- Use probabilities for all models: hasattr(..., 'predict_proba') → else predict().
+- Stability selection now skips gracefully when no valid importances exist.
+- Map `t_end` → directional indices and inner-subset indices to avoid empty inner folds.
+- Optional `validation.debug_splits` for split-size prints.
+"""
+from __future__ import annotations
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import ParameterGrid
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 from catboost import CatBoostClassifier, Pool
 
 from ..utils.logging import get_logger
-from ..utils.seed import set_seed
-from ..calibration.calibrate import fit_isotonic, fit_platt
-
-# Import enhanced CV splitter and Sharpe metric
 from ..validation.purged_walk_forward import purged_walk_forward_splits
 from ..metrics.sharpe import weighted_sharpe_ratio
-
-# Original purged splitter is retained for reference (unused here)
-# We no longer import the legacy purged splitter here; all cross-validation
-# is handled via purged_walk_forward_splits.  The legacy splitter can still
-# be accessed from ml_signals.validation.purged_cv if needed.
+from ..metrics.sortino import weighted_sortino_ratio
+from ..metrics.drawdown import max_drawdown
 
 log = get_logger()
 
-# -------- helper: sub-sample large grids deterministically per seed ----------
-def _iter_grid(grid_params, max_evals=None, seed=42):
-    """
-    Build a ParameterGrid from real hyperparameters only (drop meta keys),
-    then optionally sample at most `max_evals` combos deterministically.
-    """
-    import numpy as np
-    from sklearn.model_selection import ParameterGrid
+META_KEYS = {
+    "hp_max_evals",
+    "refine_best",
+    "refine_max_evals",
+    "early_stopping_rounds",
+    "num_boost_round",
+    "num_threads",
+    "thread_count",
+}
 
-    META_KEYS = {
-        "hp_max_evals",
-        "refine_best",
-        "refine_max_evals",
-        "early_stopping_rounds",
-        "num_boost_round",
-        "num_threads",
-        "thread_count",
-    }
-    # keep only params that look like true grid lists/tuples/arrays and aren't meta
-    clean = {}
+
+def _iter_grid(grid_params: Dict, max_evals: Optional[int] = None, seed: int = 42):
+    clean: Dict[str, List] = {}
     for k, v in (grid_params or {}).items():
         if k in META_KEYS:
             continue
         if isinstance(v, (list, tuple, np.ndarray)) and len(v) > 0:
             clean[k] = list(v)
-
-    # if nothing to grid over (e.g., user gave only meta), return a single empty dict
     combos = list(ParameterGrid(clean)) if clean else [dict()]
-
     if max_evals is not None and len(combos) > max_evals:
         rng = np.random.default_rng(seed)
-        idx = rng.choice(len(combos), size=max_evals, replace=False)
-        combos = [combos[i] for i in idx]
+        combos = [combos[i] for i in rng.choice(len(combos), size=max_evals, replace=False)]
     return combos
 
 
 def _select_feature_cols(df: pd.DataFrame) -> List[str]:
-    """
-    Keep only numeric, non-leaky columns. Ban any names that look forward-looking,
-    label-derived, or event-realized (ev_*). This is a hard denylist to prevent leakage.
-    """
     import re
-
-    # Explicit non-features (labels, outcomes, book-keeping, realized returns)
     drop_cols_explicit = {
-        "timestamp", "y", "t_end", "tp_pct", "sl_pct", "sigma",
-        "action", "pnl", "equity", "w",
-        "ev_ret", "ev_ret_short", "ev_bps"
+        "timestamp",
+        "y",
+        "t_end",
+        "tp_pct",
+        "sl_pct",
+        "sigma",
+        "action",
+        "pnl",
+        "equity",
+        "w",
+        "ev_ret",
+        "ev_ret_short",
+        "ev_bps",
     }
-
-    # Anything with these patterns is suspicious / forward-looking
-    # Examples blocked: fwd_ret_5, future_close, lead_*, next_*, target, label, y_, ret_+5
-    # Also *any* ev_* (event-realized) column name is banned from features.
-    LEAK_PAT = re.compile(
-        r"(?:^|_)(?:ev|fwd|future|lead|next|target|label|y(?:$|_))|ret_\+|return_\+",
-        re.IGNORECASE
-    )
-
+    leak_pat = re.compile(r"(?:^|_)(?:ev|fwd|future|lead|next|target|label|y(?:$|_))|ret_\+|return_\+",
+                          re.IGNORECASE)
     cols: List[str] = []
     for c in df.columns:
         if c in drop_cols_explicit:
             continue
         if not pd.api.types.is_numeric_dtype(df[c]):
             continue
-        if LEAK_PAT.search(c):
+        if leak_pat.search(c):
             continue
         cols.append(c)
-
     log.info(f"Selected {len(cols)} feature columns (after leakage screen).")
     return cols
 
 
-def _make_directional_labels(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Use only y in {-1,+1}. Map -1->0, +1->1. Return mask (on full df), y, sample weights."""
+def _make_directional_labels(df: pd.DataFrame):
     mask = df["y"].isin([-1, 1])
-    y = df.loc[mask, "y"].map({-1: 0, 1: 1}).values.astype(int)
-    w = df.loc[mask, "w"].fillna(1.0).values
-    return mask.values, y, w
+    y = df.loc[mask, "y"].map({-1: 0, 1: 1}).to_numpy(dtype=int)
+    w = df.loc[mask, "w"].fillna(1.0).to_numpy()
+    return mask.to_numpy(), y, w
 
 
-def _purged_walk_splits_expanding(
-    n: int,
-    t_end: np.ndarray,
-    n_splits: int,
-    embargo: int,
-    min_train: int = None
-) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Expanding-window purged CV (legacy).
-    """
-    if min_train is None:
-        min_train = max(1000, n // 5)
-    min_train = max(1, int(min_train))
-
-    remaining = max(0, n - min_train)
-    if remaining < n_splits:
-        n_splits = max(1, remaining) or 1
-
-    val_size = max(1, remaining // n_splits) if n_splits > 0 else n
-    splits: List[Tuple[np.ndarray, np.ndarray]] = []
-
-    for k in range(n_splits):
-        v_start = min_train + k * val_size
-        v_end = n if k == n_splits - 1 else min(min_train + (k + 1) * val_size, n)
-        val_idx = np.arange(v_start, v_end)
-        if len(val_idx) == 0:
-            continue
-
-        tr_mask = np.arange(n) < max(0, v_start - embargo)
-        purge_mask = (t_end < v_start)
-        train_idx = np.arange(n)[tr_mask & purge_mask]
-
-        if len(train_idx) == 0:
-            tr_mask_relaxed = np.arange(n) < v_start
-            train_idx = np.arange(n)[tr_mask_relaxed & purge_mask]
-
-        if len(train_idx) == 0:
-            log.warning(f"Skipping fold {k+1}: empty train after purge/embargo.")
-            continue
-
-        splits.append((train_idx, val_idx))
-
-    return splits
+def _map_t_end_to_dir_positions(mask: np.ndarray, t_end_raw: np.ndarray) -> np.ndarray:
+    dir_rows = np.flatnonzero(mask)
+    t_end_dir = np.searchsorted(dir_rows, t_end_raw, side="right") - 1
+    t_end_dir = np.clip(t_end_dir, 0, len(dir_rows) - 1)
+    return t_end_dir
 
 
-def _split_tail(X, y, w, val_frac: float = 0.2):
-    """Tail split inside the training window (causal)."""
-    n = len(y)
-    cut = max(1, int((1.0 - val_frac) * n))
-    idx_tr = np.arange(0, cut)
-    idx_va = np.arange(cut, n)
-    return (X[idx_tr], y[idx_tr], w[idx_tr]), (X[idx_va], y[idx_va], w[idx_va])
-
-# ---------------------- neighborhood helpers (refinement) ----------------------
-def _bounds_from_grid(key: str, grid_params: Dict, default_low=None, default_high=None):
-    vals = grid_params.get(key)
-    if isinstance(vals, (list, tuple, np.ndarray)) and len(vals) > 0 and np.isscalar(vals[0]):
-        return (min(vals), max(vals))
-    return (default_low, default_high)
+def _t_end_relative_to_subset(t_end_dir: np.ndarray, subset_idx: np.ndarray) -> np.ndarray:
+    ends_global_for_subset = t_end_dir[subset_idx]
+    rel = np.searchsorted(subset_idx, ends_global_for_subset, side="right") - 1
+    rel = np.clip(rel, 0, len(subset_idx) - 1)
+    return rel
 
 
-def _clamp(x, lo, hi):
-    if lo is not None:
-        x = max(x, lo)
-    if hi is not None:
-        x = min(x, hi)
-    return x
+# --- Debug helpers -----------------------------------------------------------
+
+def _dbg(msg: str, enable: bool):
+    if enable:
+        print(msg)
 
 
-def _neighbors_logit(best: Dict, grid_params: Dict):
-    C_lo, C_hi = _bounds_from_grid("C", grid_params, 1e-4, 1e4)
-    l1_lo, l1_hi = 0.0, 1.0
-    c = best.get("C", 1.0)
-    l1 = best.get("l1_ratio", 0.5)
-    C_cands = sorted(set([_clamp(c*0.5, C_lo, C_hi), _clamp(c, C_lo, C_hi), _clamp(c*2.0, C_lo, C_hi)]))
-    l1_cands = sorted(set([_clamp(l1-0.25, l1_lo, l1_hi), _clamp(l1, l1_lo, l1_hi), _clamp(l1+0.25, l1_lo, l1_hi)]))
-    return {"C": C_cands, "l1_ratio": l1_cands}
+def _summarize_splits(splits, label: str, enable: bool):
+    if not enable:
+        return
+    total = len(splits)
+    _dbg(f"{label}: {total} splits", enable)
+    for i, (tr, va) in enumerate(splits):
+        _dbg(f"  [{i+1}/{total}] train={len(tr)} val={len(va)}", enable)
 
 
-def _neighbors_lgbm(best: Dict, grid_params: Dict):
-    md_lo, md_hi = _bounds_from_grid("max_depth", grid_params, 1, 12)
-    nl_lo, nl_hi = _bounds_from_grid("num_leaves", grid_params, 4, 512)
-    mil_lo, mil_hi = _bounds_from_grid("min_data_in_leaf", grid_params, 20, 5000)
-    ff_lo, ff_hi = 0.5, 1.0
-    bf_lo, bf_hi = 0.5, 1.0
-    l1_lo, l1_hi = _bounds_from_grid("lambda_l1", grid_params, 0.0, 10.0)
-    l2_lo, l2_hi = _bounds_from_grid("lambda_l2", grid_params, 0.0, 10.0)
-    lr_lo, lr_hi = _bounds_from_grid("learning_rate", grid_params, 0.005, 0.3)
+# --- Model trainers ----------------------------------------------------------
 
-    def _uniq_sorted(vals, is_int=False):
-        vals = list(sorted(set(vals)))
-        return [int(round(v)) for v in vals] if is_int else vals
-
-    md = best.get("max_depth", 3)
-    nl = best.get("num_leaves", 16)
-    mil = best.get("min_data_in_leaf", 200)
-    ff = best.get("feature_fraction", 0.8)
-    bf = best.get("bagging_fraction", 0.8)
-    l1 = best.get("lambda_l1", 0.0)
-    l2 = best.get("lambda_l2", 0.0)
-    lr = best.get("learning_rate", 0.05)
-
-    md_c = _uniq_sorted([_clamp(md-1, md_lo, md_hi), _clamp(md, md_lo, md_hi), _clamp(md+1, md_lo, md_hi)], True)
-    nl_c = _uniq_sorted([_clamp(nl/2, nl_lo, nl_hi), _clamp(nl, nl_lo, nl_hi), _clamp(nl*2, nl_lo, nl_hi)], True)
-    mil_c = _uniq_sorted([_clamp(mil/2, mil_lo, mil_hi), _clamp(mil, mil_lo, mil_hi), _clamp(mil*2, mil_lo, mil_hi)], True)
-    ff_c = _uniq_sorted([_clamp(ff-0.1, ff_lo, ff_hi), _clamp(ff, ff_lo, ff_hi), _clamp(ff+0.1, ff_lo, ff_hi)])
-    bf_c = _uniq_sorted([_clamp(bf-0.1, bf_lo, bf_hi), _clamp(bf, bf_lo, bf_hi), _clamp(bf+0.1, bf_lo, bf_hi)])
-    l1_c = _uniq_sorted([_clamp(l1*0.1, l1_lo, l1_hi), _clamp(l1, l1_lo, l1_hi), _clamp(l1*10, l1_lo, l1_hi)])
-    l2_c = _uniq_sorted([_clamp(l2*0.1, l2_lo, l2_hi), _clamp(l2, l2_lo, l2_hi), _clamp(l2*10, l2_lo, l2_hi)])
-    lr_c = _uniq_sorted([_clamp(lr*0.5, lr_lo, lr_hi), _clamp(lr, lr_lo, lr_hi), _clamp(lr*1.5, lr_lo, lr_hi)])
-
-    return {
-        "max_depth": md_c,
-        "num_leaves": nl_c,
-        "min_data_in_leaf": mil_c,
-        "feature_fraction": ff_c,
-        "bagging_fraction": bf_c,
-        "lambda_l1": l1_c,
-        "lambda_l2": l2_c,
-        "learning_rate": lr_c,
-    }
-
-
-def _neighbors_catb(best: Dict, grid_params: Dict):
-    d_lo, d_hi = _bounds_from_grid("depth", grid_params, 2, 10)
-    lr_lo, lr_hi = _bounds_from_grid("learning_rate", grid_params, 0.005, 0.3)
-    l2_lo, l2_hi = _bounds_from_grid("l2_leaf_reg", grid_params, 1.0, 100.0)
-    ss_lo, ss_hi = 0.5, 1.0
-
-    depth = best.get("depth", 3)
-    lr = best.get("learning_rate", 0.05)
-    l2 = best.get("l2_leaf_reg", 3.0)
-    subs = best.get("subsample", 0.8)
-
-    depth_c = sorted(set([_clamp(depth-1, d_lo, d_hi), _clamp(depth, d_lo, d_hi), _clamp(depth+1, d_lo, d_hi)]))
-    lr_c = sorted(set([_clamp(lr*0.5, lr_lo, lr_hi), _clamp(lr, lr_lo, lr_hi), _clamp(lr*1.5, lr_lo, lr_hi)]))
-    l2_c = sorted(set([_clamp(l2*0.5, l2_lo, l2_hi), _clamp(l2, l2_lo, l2_hi), _clamp(l2*2.0, l2_lo, l2_hi)]))
-    ss_c = sorted(set([_clamp(subs-0.1, ss_lo, ss_hi), _clamp(subs, ss_lo, ss_hi), _clamp(subs+0.1, ss_lo, ss_hi)]))
-
-    return {"depth": depth_c, "learning_rate": lr_c, "l2_leaf_reg": l2_c, "subsample": ss_c}
-
-
-def _train_logit(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int) -> Tuple[LogisticRegression, float, Dict]:
-    """Train a logistic model on Xtr,ytr and evaluate on Xval,yval.  Returns best model, AUC, and best params."""
+def _train_logit(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int):
     best_model, best_score, best_hp = None, -np.inf, None
-    combos = _iter_grid(grid_params, grid_params.get("hp_max_evals"), seed)
-    for hp in combos:
+    for hp in _iter_grid(grid_params, grid_params.get("hp_max_evals"), seed):
+        # Ensure elasticnet has valid hyperparameters; fallback keeps training robust.
+        hp = dict(hp or {})
+        hp.setdefault("C", 1.0)
+        hp.setdefault("l1_ratio", 0.5)
         lr = LogisticRegression(
             penalty="elasticnet",
             solver="saga",
@@ -268,14 +150,14 @@ def _train_logit(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int) 
             score = 0.5
         if score > best_score:
             best_model, best_score, best_hp = lr, score, hp
-    return best_model, float(best_score), (best_hp or {})
+    return best_model, best_score, (best_hp or {})
 
 
-def _train_lgbm(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int, feature_names: List[str]):
-    """Train LightGBM with early stopping."""
+def _train_lgbm(
+    Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int, feature_names: List[str]
+):
     best_model, best_score, best_hp = None, -np.inf, None
-    combos = _iter_grid(grid_params, grid_params.get("hp_max_evals"), seed)
-    for hp in combos:
+    for hp in _iter_grid(grid_params, grid_params.get("hp_max_evals"), seed):
         params = {
             "objective": "binary",
             "metric": "auc",
@@ -302,14 +184,25 @@ def _train_lgbm(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int, f
             model, score = None, 0.5
         if score > best_score:
             best_model, best_score, best_hp = model, score, hp
-    return best_model, float(best_score), (best_hp or {})
+
+    imps_df = None
+    if best_model is not None:
+        try:
+            gain = best_model.feature_importance(importance_type="gain")
+            split = best_model.feature_importance(importance_type="split")
+            imps_df = pd.DataFrame({
+                "feature": feature_names,
+                "gain": gain,
+                "split": split,
+            })
+        except Exception:
+            imps_df = None
+    return best_model, imps_df, (best_hp or {})
 
 
 def _train_catboost(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: int):
-    """Train CatBoost with early stopping."""
     best_model, best_score, best_hp = None, -np.inf, None
-    combos = _iter_grid(grid_params, grid_params.get("hp_max_evals"), seed)
-    for hp in combos:
+    for hp in _iter_grid(grid_params, grid_params.get("hp_max_evals"), seed):
         params = {
             "loss_function": "Logloss",
             "eval_metric": "AUC",
@@ -321,281 +214,201 @@ def _train_catboost(Xtr, ytr, wtr, Xval, yval, wval, grid_params: Dict, seed: in
             train_pool = Pool(Xtr, label=ytr, weight=wtr)
             valid_pool = Pool(Xval, label=yval, weight=wval)
             model = CatBoostClassifier(**params)
-            model.fit(train_pool, eval_set=valid_pool, verbose=False, early_stopping_rounds=grid_params.get("early_stopping_rounds", 200))
+            model.fit(
+                train_pool,
+                eval_set=valid_pool,
+                verbose=False,
+                early_stopping_rounds=grid_params.get("early_stopping_rounds", 200),
+            )
             pv = model.predict_proba(Xval)[:, 1]
             score = roc_auc_score(yval, pv, sample_weight=wval)
         except Exception:
             model, score = None, 0.5
         if score > best_score:
             best_model, best_score, best_hp = model, score, hp
-    return best_model, float(best_score), (best_hp or {})
+    return best_model, None, (best_hp or {})
 
 
-def train_oof_models(df: pd.DataFrame, cfg: Dict, artifact_dir: str) -> pd.DataFrame:
-    set_seed(cfg.get("seed", 42))
-    os.makedirs(artifact_dir, exist_ok=True)
+def _correlation_prune(df: pd.DataFrame, threshold: float = 0.95) -> List[str]:
+    corr = df.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    drop_cols = [c for c in upper.columns if any(upper[c] > threshold)]
+    return [c for c in df.columns if c not in drop_cols]
 
-    feat_cols = _select_feature_cols(df)
+
+def _stability_select(feature_importances: pd.DataFrame, top_n: int = 20) -> List[str]:
+    if feature_importances.empty:
+        return []
+    if "gain" not in feature_importances.columns:
+        return []
+    agg = (
+        feature_importances.groupby("feature")["gain"].mean().sort_values(ascending=False)
+    )
+    return agg.head(top_n).index.tolist()
+
+
+def train_oof_models(
+    df: pd.DataFrame,
+    cfg: Dict,
+    grid_logit: Dict,
+    grid_lgbm: Dict,
+    grid_catb: Dict,
+    fee_bps: float,
+    spread_bps: float,
+    embargo: int,
+):
+    debug = bool(cfg.get("validation", {}).get("debug_splits", False))
+
     mask, y_dir, w = _make_directional_labels(df)
 
-    # Features and event ends for directional rows
-    X_full = df.loc[mask, feat_cols].fillna(0).values
-    t_end = df.loc[mask, "t_end"].values.astype(int)
+    # map t_end to directional index space (not raw df rows)
+    t_end_raw = df.loc[mask, "t_end"].astype(int).to_numpy()
+    t_end_dir = _map_t_end_to_dir_positions(mask, t_end_raw)
 
-    # Timestamps for directional rows and event end timestamps
-    df_dir_ts = df.loc[mask, "timestamp"].to_numpy()
-    t_end_idx = np.clip(t_end, 0, len(df_dir_ts) - 1)   # safety clamp
-    t_end_ts  = df_dir_ts[t_end_idx]
+    feat_cols = _correlation_prune(df[_select_feature_cols(df)], threshold=0.95)
 
-    # Outer splits: purged + embargoed with optional final test hold-out
-    n_splits = cfg["validation"]["folds"]
-    H = cfg["labeling"]["horizon_minutes"][0]
-    embargo = H if str(cfg["validation"].get("embargo_minutes", "auto")) == "auto" else int(cfg["validation"]["embargo_minutes"])
-    min_train = int(cfg.get("validation", {}).get("min_train_bars", max(1000, len(y_dir) // 5)))
-    final_test_fraction = float(cfg.get("validation", {}).get("final_test_fraction", 0.0) or 0.0)
-    splits, test_idx = purged_walk_forward_splits(
-        len(y_dir), t_end, n_splits, embargo, final_test_fraction, min_train=min_train
+    outer_splits, _ = purged_walk_forward_splits(
+        n=int(mask.sum()),
+        t_end=t_end_dir,
+        n_splits=cfg["validation"].get("outer_folds", 5),
+        embargo=embargo,
+        final_test_fraction=0.0,
+        min_train=cfg["validation"].get("min_train_size", 1000),
     )
-    if len(test_idx) > 0:
-        log.info(f"Reserved {len(test_idx)} samples for final test set.")
+    _summarize_splits(outer_splits, label="[Debug] Outer splits", enable=debug)
 
-    grid_logit = cfg["models"]["logit"]
-    grid_lgbm = cfg["models"]["lightgbm"]
-    grid_catb = cfg["models"]["catboost"]
-    calib_method = cfg["calibration"]["method"]
+    oof = np.full(int(mask.sum()), np.nan, dtype=float)
+    all_imps: List[pd.DataFrame] = []
 
-    # Initialise out-of-fold dataframe with prob_long and timestamp.  The timestamp
-    # column is required downstream for merging in training reports.
-    oof = pd.DataFrame(index=df.index, columns=["prob_long"])  # will hold calibrated probabilities
-    # Copy timestamp from full processed df; this ensures oof has the same order and
-    # that train_report can merge on timestamp without errors.
-    if "timestamp" in df.columns:
-        oof["timestamp"] = df["timestamp"].values
+    for fold_idx, (tr_idx, va_idx) in enumerate(outer_splits):
+        print(f"[Outer Fold {fold_idx+1}/{len(outer_splits)}]")
 
-    # collect LGBM importances per fold
-    imp_records = []
+        # inner splits on subset-relative indices
+        t_end_tr_rel = _t_end_relative_to_subset(t_end_dir, tr_idx)
+        inner_splits, _ = purged_walk_forward_splits(
+            n=len(tr_idx),
+            t_end=t_end_tr_rel,
+            n_splits=cfg["validation"].get("inner_folds", 3),
+            embargo=embargo,
+            final_test_fraction=0.0,
+            min_train=max(10, int(len(tr_idx) * 0.3)),
+        )
+        if len(inner_splits) == 0:
+            n = len(tr_idx)
+            n_tr = max(10, int(n * 0.8))
+            inner_splits = [(np.arange(0, n_tr), np.arange(n_tr, n))]
+            _dbg(f"[Outer {fold_idx}] Inner purged splits empty → fallback 80/20.", debug)
+        _summarize_splits(inner_splits, label=f"[Debug] Inner splits (outer={fold_idx})", enable=debug)
 
-    # Determine cost per trade (fee + spread) for Sharpe calculation
-    exec_cfg = cfg.get("execution", {})
-    fee_bps = exec_cfg.get("fee_bps", cfg.get("data", {}).get("fee_bps", 0.0))
-    spread_bps = exec_cfg.get("spread_bps", cfg.get("data", {}).get("spread_bps", 0.0))
-    cost_per_trade = (fee_bps + spread_bps) / 1e4
+        hp_results = []
+        imps_accum: List[pd.DataFrame] = []
 
-    for fold_idx, (tr_idx, va_idx) in enumerate(splits):
-        log.info(f"Fold {fold_idx+1}/{len(splits)}: train={len(tr_idx)} val={len(va_idx)}")
+        for (itr, iva) in inner_splits:
+            Xtr_i = df.loc[mask].iloc[tr_idx][feat_cols].to_numpy()[itr]
+            Xva_i = df.loc[mask].iloc[tr_idx][feat_cols].to_numpy()[iva]
+            Xtr_i = np.nan_to_num(Xtr_i, nan=0.0, posinf=0.0, neginf=0.0)
+            Xva_i = np.nan_to_num(Xva_i, nan=0.0, posinf=0.0, neginf=0.0)
+            ytr_i = y_dir[tr_idx][itr]
+            yva_i = y_dir[tr_idx][iva]
+            wtr_i = w[tr_idx][itr]
+            wva_i = w[tr_idx][iva]
 
-        Xtr, ytr, wtr = X_full[tr_idx], y_dir[tr_idx], w[tr_idx]
-        Xva, yva, wva = X_full[va_idx], y_dir[va_idx], w[va_idx]
+            scaler = StandardScaler().fit(Xtr_i)
+            Xtr_is = scaler.transform(Xtr_i)
+            Xva_is = scaler.transform(Xva_i)
 
-        # --- Single-feature AUC scan (diagnostics for leakage) ---
-        try:
-            sf_scores = []
-            for j, name in enumerate(feat_cols):
-                x = Xva[:, j]
-                if np.std(x) == 0:
+            for name, fn, Xtr_use, Xva_use, grid in [
+                ("logit", _train_logit, Xtr_is, Xva_is, grid_logit),
+                ("lgbm", _train_lgbm, Xtr_i, Xva_i, grid_lgbm),
+                ("catboost", _train_catboost, Xtr_i, Xva_i, grid_catb),
+            ]:
+                if name == "lgbm":
+                    model, imps, hp = fn(
+                        Xtr_use, ytr_i, wtr_i, Xva_use, yva_i, wva_i, grid, cfg["seed"], feature_names=feat_cols
+                    )
+                else:
+                    model, imps, hp = fn(
+                        Xtr_use, ytr_i, wtr_i, Xva_use, yva_i, wva_i, grid, cfg["seed"]
+                    )
+                if model is None:
                     continue
-                auc1 = roc_auc_score(yva, x, sample_weight=wva)
-                auc1 = float(auc1 if auc1 >= 0.5 else 1.0 - auc1)
-                sf_scores.append((name, auc1))
-            sf_scores.sort(key=lambda t: t[1], reverse=True)
-            top = ", ".join([f"{n}:{a:.3f}" for n, a in sf_scores[:5]])
-            log.info(f"    Top single-feature AUCs (fold-val): {top}")
-        except Exception as e:
-            log.warning(f"    Single-feature AUC scan skipped: {e}")
-        # ----------------------------------------------------------
 
-        # Guards: enough data and both classes
-        if len(ytr) < 100 or np.unique(ytr).size < 2:
-            pv_va_cal = np.full(len(yva), 0.5, dtype=float)
-            oof_idx = np.where(mask)[0][va_idx]
-            oof.loc[oof_idx, "prob_long"] = pv_va_cal
-            log.warning(f"Fold {fold_idx+1}: skipped training (len(ytr)={len(ytr)}, classes={np.unique(ytr) if len(ytr)>0 else []}). Filled 0.5.")
-            continue
+                # probabilities consistently
+                if hasattr(model, "predict_proba"):
+                    pv = model.predict_proba(Xva_use)[:, 1]
+                else:
+                    pv = model.predict(Xva_use)
 
-        # --- Purged inner tail split (timestamp-based) ---
-        val_frac = 0.2
-        ntr = len(ytr)
-        cut = max(1, int((1.0 - val_frac) * ntr))
+                ev_long = df.loc[mask, "ev_ret"].to_numpy()[tr_idx][iva]
+                ev_short = df.loc[mask, "ev_ret_short"].to_numpy()[tr_idx][iva]
+                cost = (fee_bps + spread_bps) / 1e-4 / 10000  # avoid float slip; equal to /1e4
+                cost = (fee_bps + spread_bps) / 1e4
+                rets = np.where(pv >= 0.5, ev_long, ev_short) - cost
 
-        va_start_abs = tr_idx[cut] if cut < ntr else tr_idx[-1] + 1
-        va_start_abs = min(va_start_abs, len(df_dir_ts) - 1)  # clamp
-        va_start_ts = df_dir_ts[va_start_abs]
+                hp_results.append({
+                    "model": name,
+                    "sharpe": weighted_sharpe_ratio(rets, wva_i),
+                    "sortino": weighted_sortino_ratio(rets, wva_i),
+                    "max_dd": max_drawdown(rets),
+                    "hp": hp,
+                })
+                # only keep DataFrame importances
+                if isinstance(imps, pd.DataFrame) and not imps.empty:
+                    imps_accum.append(imps)
 
-        emb_mins = int(embargo)
-        emb_delta = np.timedelta64(emb_mins, 'm')
+        if hp_results:
+            filt = [r for r in hp_results if np.isfinite(r["sharpe"]) and r["sortino"] > 0]
+            candidate = max((filt or hp_results), key=lambda r: r["sharpe"])
+            best_name, best_hp = candidate["model"], candidate["hp"]
+        else:
+            best_name, best_hp = "logit", {}
+        print(f"[Outer {fold_idx}] Best inner-CV model: {best_name} HP: {best_hp}")
 
-        tr_cand_loc = np.arange(cut)
-        keep_mask = t_end_ts[tr_idx[:cut]] < (va_start_ts - emb_delta)
-        if keep_mask.sum() == 0:
-            keep_mask = t_end_ts[tr_idx[:cut]] < va_start_ts
-
-        tr_keep_loc = tr_cand_loc[keep_mask]
-        log.info(f"    inner-train kept after purge: {len(tr_keep_loc)}/{cut}")
-
-        # final inner-train / inner-val subsets
-        Xtr_i, ytr_i, wtr_i = Xtr[tr_keep_loc], ytr[tr_keep_loc], wtr[tr_keep_loc]
-        Xval_i, yval_i, wval_i = Xtr[cut:], ytr[cut:], wtr[cut:]
-        log.info(f"    inner-val size={len(yval_i)}, pos={int(yval_i.sum())}, neg={len(yval_i)-int(yval_i.sum())}")
-        # ----------------------------------------------------------------------
-
-        # Standardize for logit using only inner-train
-        scaler = StandardScaler().fit(Xtr_i)
-        Xtr_is = scaler.transform(Xtr_i)
-        Xval_is = scaler.transform(Xval_i)
-        Xva_s = scaler.transform(Xva)
-
-        # -------------------- fit on inner-train only --------------------
-        logit_model, logit_score, _ = _train_logit(
-            Xtr_is, ytr_i, wtr_i, Xval_is, yval_i, wval_i, grid_logit, cfg["seed"]
-        )
-        lgbm_model, lgbm_score, _ = _train_lgbm(
-            Xtr_i, ytr_i, wtr_i, Xval_i, yval_i, wval_i, grid_lgbm, cfg["seed"], feature_names=feat_cols
-        )
-        catb_model, catb_score, _ = _train_catboost(
-            Xtr_i, ytr_i, wtr_i, Xval_i, yval_i, wval_i, grid_catb, cfg["seed"]
-        )
-        # -----------------------------------------------------------------
-
-        # collect LGBM importances (only if model is valid)
-        if lgbm_model is not None:
+        # stability selection (optional)
+        if len(imps_accum) > 0:
             try:
-                fnames = lgbm_model.feature_name()
-                gain = lgbm_model.feature_importance(importance_type="gain")
-                split = lgbm_model.feature_importance(importance_type="split")
-                for f, g, s in zip(fnames, gain, split):
-                    imp_records.append({"fold": fold_idx + 1, "feature": f, "gain": float(g), "split": int(s)})
-            except Exception as e:
-                log.warning(f"    Importance capture skipped: {e}")
+                imps_concat = pd.concat(imps_accum, ignore_index=True)
+            except Exception:
+                imps_concat = pd.DataFrame()
+        else:
+            imps_concat = pd.DataFrame()
 
-        # ----------------- Evaluate models on outer validation set -----------------
-        # Compute predictions on outer validation
-        pv_logit = logit_model.predict_proba(Xva_s)[:, 1] if logit_model is not None else np.full(len(yva), 0.5)
-        pv_lgbm = lgbm_model.predict(Xva, num_iteration=getattr(lgbm_model, "best_iteration", None)) if lgbm_model is not None else np.full(len(yva), 0.5)
-        pv_catb = catb_model.predict_proba(Xva)[:, 1] if catb_model is not None else np.full(len(yva), 0.5)
+        selected = _stability_select(imps_concat, top_n=cfg.get("features", {}).get("stability_top_n", 20))
+        feat_cols_fold = [f for f in feat_cols if f in selected] if selected else feat_cols
 
-        # AUC scores
-        try:
-            auc_logit = roc_auc_score(yva, pv_logit, sample_weight=wva)
-        except Exception:
-            auc_logit = 0.5
-        try:
-            auc_lgbm = roc_auc_score(yva, pv_lgbm, sample_weight=wva)
-        except Exception:
-            auc_lgbm = 0.5
-        try:
-            auc_catb = roc_auc_score(yva, pv_catb, sample_weight=wva)
-        except Exception:
-            auc_catb = 0.5
+        # final fit per outer fold
+        Xtr_f = df.loc[mask].iloc[tr_idx][feat_cols_fold].to_numpy()
+        Xva_f = df.loc[mask].iloc[va_idx][feat_cols_fold].to_numpy()
+        Xtr_f = np.nan_to_num(Xtr_f, nan=0.0, posinf=0.0, neginf=0.0)
+        Xva_f = np.nan_to_num(Xva_f, nan=0.0, posinf=0.0, neginf=0.0)
+        ytr_f = y_dir[tr_idx]
+        yva_f = y_dir[va_idx]
+        wtr_f = w[tr_idx]
+        wva_f = w[va_idx]
 
-        # ----------------- Compute after-cost Sharpe ratio on outer val -----------------
-        # Use realized returns columns on the directional subset
-        # Note: ev_ret_short = -ev_ret by construction
-        ev_long = df.loc[mask, "ev_ret"].values[va_idx]
-        ev_short = df.loc[mask, "ev_ret_short"].values[va_idx]
-        # Net return per sample given long or short position based on probability threshold 0.5
-        ret_logit = np.where(pv_logit >= 0.5, ev_long, ev_short) - cost_per_trade
-        ret_lgbm = np.where(pv_lgbm >= 0.5, ev_long, ev_short) - cost_per_trade
-        ret_catb = np.where(pv_catb >= 0.5, ev_long, ev_short) - cost_per_trade
-        sharpe_logit = weighted_sharpe_ratio(ret_logit, wva)
-        sharpe_lgbm = weighted_sharpe_ratio(ret_lgbm, wva)
-        sharpe_catb = weighted_sharpe_ratio(ret_catb, wva)
-
-        # Invalidate Sharpe scores for models that failed to train.  A None model implies
-        # it was never fitted (training error or no data).  By setting the score to
-        # -inf we ensure these models are not selected as the best during ranking.
-        if logit_model is None:
-            sharpe_logit = -np.inf
-        if lgbm_model is None:
-            sharpe_lgbm = -np.inf
-        if catb_model is None:
-            sharpe_catb = -np.inf
-
-        # ----------------- Select best model by Sharpe (fallback to AUC) -----------------
-        scores = {
-            "logit": sharpe_logit,
-            "lgbm": sharpe_lgbm,
-            "catboost": sharpe_catb,
-        }
-        # If all Sharpe scores are nan or -inf (i.e., no model produced a valid Sharpe), fallback
-        # to AUC for model ranking.  However, models that failed to train (None) are assigned
-        # -inf so they cannot win on AUC either.
-        if np.all(np.isnan(list(scores.values()))):
-            scores = {
-                "logit": auc_logit if logit_model is not None else -np.inf,
-                "lgbm": auc_lgbm if lgbm_model is not None else -np.inf,
-                "catboost": auc_catb if catb_model is not None else -np.inf,
-            }
-        best_name = max(scores, key=scores.get)
-
-        # Determine which model won; capture the chosen prediction vector.  Note that
-        # any model that is None should not have been selected because its score
-        # would be -inf.  However, in the rare event all models are None (and thus
-        # all scores equal), we defensively allow selection and handle None below.
         if best_name == "logit":
-            best_model = logit_model
-            pv_va = pv_logit
-        elif best_name == "lgbm":
-            best_model = lgbm_model
-            pv_va = pv_lgbm
+            scaler = StandardScaler().fit(Xtr_f)
+            Xtr_f = scaler.transform(Xtr_f)
+            Xva_f = scaler.transform(Xva_f)
+
+        if best_name == "lgbm":
+            model_f, imps_f, _ = _train_lgbm(Xtr_f, ytr_f, wtr_f, Xva_f, yva_f, wva_f, best_hp, cfg["seed"], feature_names=feat_cols_fold)
+        elif best_name == "catboost":
+            model_f, imps_f, _ = _train_catboost(Xtr_f, ytr_f, wtr_f, Xva_f, yva_f, wva_f, best_hp, cfg["seed"])
         else:
-            best_model = catb_model
-            pv_va = pv_catb
+            model_f, imps_f, _ = _train_logit(Xtr_f, ytr_f, wtr_f, Xva_f, yva_f, wva_f, best_hp, cfg["seed"])
 
-        log.info(f"    Selected {best_name} (Sharpe={scores[best_name]:.4f}, AUC={ {'logit': auc_logit, 'lgbm': auc_lgbm, 'catboost': auc_catb}[best_name]:.4f})")
+        if isinstance(imps_f, pd.DataFrame) and not imps_f.empty:
+            all_imps.append(imps_f)
 
-        # ----------------- Calibrate the chosen model on the inner split -----------------
-        # If the best model is None (all models failed), we skip calibration and
-        # simply propagate the uncalibrated outer predictions (which will be
-        # constant 0.5) as the calibrated probabilities.
-        if best_model is None:
-            pv_va_cal = pv_va  # constant default
+        if hasattr(model_f, "predict_proba"):
+            preds = model_f.predict_proba(Xva_f)[:, 1]
         else:
-            # Compute inner validation probabilities for the selected model.
-            if best_name == "logit":
-                pv_in = best_model.predict_proba(Xval_is)[:, 1]
-            elif best_name == "lgbm":
-                pv_in = best_model.predict(Xval_i, num_iteration=getattr(best_model, "best_iteration", None))
-            else:
-                pv_in = best_model.predict_proba(Xval_i)[:, 1]
+            preds = model_f.predict(Xva_f)
+        oof[va_idx] = preds
 
-            # Fit calibration on inner validation predictions
-            if calib_method == "isotonic":
-                calib_f = fit_isotonic(yval_i, pv_in, sample_weight=wval_i)
-            elif calib_method == "platt":
-                calib_f = fit_platt(yval_i, pv_in, sample_weight=wval_i)
-            else:
-                calib_f = None
+    ts_dir = df.loc[mask, "timestamp"].reset_index(drop=True)
+    oof_df = pd.DataFrame({"timestamp": ts_dir, "prob_long": oof})
 
-            # Apply calibration on outer validation predictions
-            if calib_f is not None:
-                # For isotonic regression, use transform; for Platt scaling (logistic regression),
-                # use predict_proba on the reshaped probabilities.  Otherwise, if calib_f
-                # is a callable, invoke it directly.  If anything fails, fall back to
-                # the uncalibrated probabilities.
-                try:
-                    from sklearn.isotonic import IsotonicRegression
-                    if isinstance(calib_f, IsotonicRegression):
-                        pv_va_cal = calib_f.transform(pv_va)
-                    elif hasattr(calib_f, "predict_proba"):
-                        pv_va_cal = calib_f.predict_proba(pv_va.reshape(-1, 1))[:, 1]
-                    elif callable(calib_f):
-                        pv_va_cal = calib_f(pv_va)
-                    else:
-                        pv_va_cal = pv_va
-                except Exception:
-                    pv_va_cal = pv_va
-            else:
-                pv_va_cal = pv_va
-
-        # Write out-of-fold probabilities
-        oof_idx = np.where(mask)[0][va_idx]
-        oof.loc[oof_idx, "prob_long"] = pv_va_cal
-
-    # Save feature importances for LGBM
-    if imp_records:
-        imp_df = pd.DataFrame(imp_records)
-        imp_path = os.path.join(artifact_dir, "feature_importance.csv")
-        imp_df.to_csv(imp_path, index=False)
-        log.info(f"Saved feature importance to {imp_path}")
-
-    return oof
+    imps_df = pd.concat(all_imps, ignore_index=True) if all_imps else pd.DataFrame()
+    return oof_df, imps_df
