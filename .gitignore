@@ -21,9 +21,6 @@ Thumbs.db
 
 # Project artifacts & data
 artifacts/
-reports/
-logs/
-data/
 !data/sample/**   # keep a tiny sample if you add one
 
 # Notebooks

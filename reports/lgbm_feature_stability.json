@@ -1,0 +1,6 @@
+{
+  "n_features": 41,
+  "top_k": 30,
+  "csv": "reports\\lgbm_feature_stability.csv",
+  "plot": "reports\\lgbm_feature_stability.png"
+}
