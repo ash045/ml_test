@@ -1,0 +1,141 @@
+seed: 42
+artifact_dir: artifacts
+report_dir: reports
+
+data:
+  root: data
+  raw_dir: data/raw
+  processed_dir: data/processed
+  symbol: "SOL_USD"             # CSV name without .csv
+  tz: "UTC"
+  timestamp_col: "timestamp"
+  price_col: "close"
+  ohlcv_cols: ["open","high","low","close","volume","trades"]
+  fee_bps: 7.0
+  spread_bps: 2.0
+  slippage_alpha: 0.5
+  slippage_beta_trades: 0.5          # slippage penalty when trades < ADT
+  adv_window: 240                    # window for ADT/ADV
+
+bars:
+  timeframes: ["1min","5min","15min","60min"]
+  info_bars:
+    enabled: false
+    dollar_threshold: 1000000.0
+    volume_threshold: 100.0
+    tick_threshold: 50
+
+features:
+  windows:
+    returns: [1, 5, 15, 30, 60, 90]    # added horizon-matched momentum
+    vol:     [15, 30, 60, 90, 240]     # added 30 & 90 to match horizons
+    trades:  [15, 30, 60, 90, 240]     # if trades windows are used by your pipeline
+  fractional_diff:
+    enabled: true
+    d_candidates: [0.2, 0.4]           # tighten a bit; avoid over-frac & noise
+    stationarity_test: "adf"
+  denoise:
+    ema_windows: [3, 5, 15]            # add 15 to catch horizon-scale drift
+  prune:
+    corr_threshold: 0.95
+
+signals:
+  long_prob: 0.60
+  short_prob: 0.40
+
+labeling:
+  horizon_minutes: [30, 60, 90]
+  k_sigma: [1.0, 1.5, 2.0]
+  sigma_window: 240
+  neutral_label: 0
+  use_uniqueness_weights: true
+
+validation:
+  folds: 5
+  min_train_bars: 5000
+  embargo_minutes: "auto"            # equals H if "auto"
+  nested_tuning: true
+  final_test_fraction: 0.1
+
+models:
+  logit:
+    C: [0.01, 0.1, 1.0, 10.0]
+    l1_ratio: [0.0, 0.25, 0.5, 0.75, 1.0]
+    hp_max_evals: 12
+    refine_best: true
+    refine_max_evals: 12
+
+  lightgbm:
+    max_depth: [3, 4, 5]
+    num_leaves: [8, 16, 32]
+    min_data_in_leaf: [200, 500, 1000]
+    feature_fraction: [0.6, 0.8]
+    bagging_fraction: [0.6, 0.8]
+    lambda_l1: [0.0, 0.001, 0.01, 0.1]
+    lambda_l2: [0.0, 0.001, 0.01, 0.1]
+    learning_rate: [0.02, 0.05, 0.1]
+    early_stopping_rounds: 200
+    num_boost_round: 5000
+    hp_max_evals: 40
+    refine_best: true
+    refine_max_evals: 20
+
+  catboost:
+    depth: [3, 4, 5]
+    learning_rate: [0.02, 0.05, 0.1]
+    l2_leaf_reg: [1.0, 3.0, 10.0, 30.0]
+    subsample: [0.6, 0.8]
+    early_stopping_rounds: 200
+    hp_max_evals: 20
+    refine_best: true
+    refine_max_evals: 10
+
+calibration:
+  method: "isotonic"
+
+ensemble:
+  method: "weighted_average"
+  weights: null
+
+execution:
+  tp_sigma_mult: "use_k_from_label"
+  cost_margin_mult: 2.0
+  ret_col: ev_ret_90
+  fee_bps: 2.0
+  spread_bps: 1.0
+  slippage_alpha: 0.5
+  adt_window: 60
+  mapper_combine: union  # was "intersect"  # intersect | threshold_only | mapper_only | union
+  liquidity_gate:
+    enabled: true
+    window: 60
+    min_trades_pct_of_adt: 0.5
+    min_volume_pct_of_adv: 0.5
+  hysteresis:
+    enter_ev_min: 0.0
+    exit_ev_min: -9999.0
+    persistence_bars: 2
+    cooldown_minutes: 15
+  sizing:
+    vol_target_annual: 0.10
+    max_leverage: 2.0
+    max_turnover_per_day: 5.0
+  participation_caps:
+    max_participation_trades: 0.10
+    max_participation_volume: 0.10
+
+backtest:
+  order_latency: "next_bar_open"
+  fill_spread_half: true
+  slippage_model: "vol_sqrt_size"
+
+monitoring:
+  alert_drawdown_daily_bps: 200
+  alert_latency_sec: 3
+  brier_drift_tol: 0.05
+
+threshold_opt:
+  holdout_frac: 0.8           # fine to keep
+  apply_execution_mapping: true
+  min_trades_train: 100       # was 100; keep or lower to 50 if needed
+  min_trades_holdout: 5       # was 20 → relax so it doesn’t drop to zero

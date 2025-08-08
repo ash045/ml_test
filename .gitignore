@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Project artifacts & data
+artifacts/
+reports/
+logs/
+data/
+!data/sample/**   # keep a tiny sample if you add one
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Matplotlib cache
+.matplotlib/
+
+# Local config variants
+configs/local*.yaml

@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+scikit-learn
+lightgbm
+catboost
+pyyaml
+statsmodels
+shap
+matplotlib
+tqdm
+pytest
