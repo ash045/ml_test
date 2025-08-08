@@ -18,7 +18,9 @@ from ..validation.purged_walk_forward import purged_walk_forward_splits
 from ..metrics.sharpe import weighted_sharpe_ratio
 
 # Original purged splitter is retained for reference (unused here)
-from ..validation.purged_cv import _purged_walk_splits_expanding  # noqa: F401
+# We no longer import the legacy purged splitter here; all cross-validation
+# is handled via purged_walk_forward_splits.  The legacy splitter can still
+# be accessed from ml_signals.validation.purged_cv if needed.
 
 log = get_logger()
 
