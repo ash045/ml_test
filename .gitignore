@@ -34,3 +34,5 @@ data/
 
 # Local config variants
 configs/local*.yaml
+
+share_bundle.zip
