@@ -450,15 +450,16 @@ def train_oof_models(df: pd.DataFrame, cfg: Dict, artifact_dir: str) -> pd.DataF
         )
         # -----------------------------------------------------------------
 
-        # collect LGBM importances (even if LGBM not the winner)
-        try:
-            fnames = lgbm_model.feature_name()
-            gain = lgbm_model.feature_importance(importance_type="gain")
-            split = lgbm_model.feature_importance(importance_type="split")
-            for f, g, s in zip(fnames, gain, split):
-                imp_records.append({"fold": fold_idx + 1, "feature": f, "gain": float(g), "split": int(s)})
-        except Exception as e:
-            log.warning(f"    Importance capture skipped: {e}")
+        # collect LGBM importances (only if model is valid)
+        if lgbm_model is not None:
+            try:
+                fnames = lgbm_model.feature_name()
+                gain = lgbm_model.feature_importance(importance_type="gain")
+                split = lgbm_model.feature_importance(importance_type="split")
+                for f, g, s in zip(fnames, gain, split):
+                    imp_records.append({"fold": fold_idx + 1, "feature": f, "gain": float(g), "split": int(s)})
+            except Exception as e:
+                log.warning(f"    Importance capture skipped: {e}")
 
         # ----------------- Evaluate models on outer validation set -----------------
         # Compute predictions on outer validation
@@ -493,21 +494,37 @@ def train_oof_models(df: pd.DataFrame, cfg: Dict, artifact_dir: str) -> pd.DataF
         sharpe_lgbm = weighted_sharpe_ratio(ret_lgbm, wva)
         sharpe_catb = weighted_sharpe_ratio(ret_catb, wva)
 
+        # Invalidate Sharpe scores for models that failed to train.  A None model implies
+        # it was never fitted (training error or no data).  By setting the score to
+        # -inf we ensure these models are not selected as the best during ranking.
+        if logit_model is None:
+            sharpe_logit = -np.inf
+        if lgbm_model is None:
+            sharpe_lgbm = -np.inf
+        if catb_model is None:
+            sharpe_catb = -np.inf
+
         # ----------------- Select best model by Sharpe (fallback to AUC) -----------------
         scores = {
             "logit": sharpe_logit,
             "lgbm": sharpe_lgbm,
             "catboost": sharpe_catb,
         }
-        # If all Sharpe scores are nan or zero, fallback to AUC
+        # If all Sharpe scores are nan or -inf (i.e., no model produced a valid Sharpe), fallback
+        # to AUC for model ranking.  However, models that failed to train (None) are assigned
+        # -inf so they cannot win on AUC either.
         if np.all(np.isnan(list(scores.values()))):
             scores = {
-                "logit": auc_logit,
-                "lgbm": auc_lgbm,
-                "catboost": auc_catb,
+                "logit": auc_logit if logit_model is not None else -np.inf,
+                "lgbm": auc_lgbm if lgbm_model is not None else -np.inf,
+                "catboost": auc_catb if catb_model is not None else -np.inf,
             }
         best_name = max(scores, key=scores.get)
 
+        # Determine which model won; capture the chosen prediction vector.  Note that
+        # any model that is None should not have been selected because its score
+        # would be -inf.  However, in the rare event all models are None (and thus
+        # all scores equal), we defensively allow selection and handle None below.
         if best_name == "logit":
             best_model = logit_model
             pv_va = pv_logit
@@ -520,43 +537,49 @@ def train_oof_models(df: pd.DataFrame, cfg: Dict, artifact_dir: str) -> pd.DataF
 
         log.info(f"    Selected {best_name} (Sharpe={scores[best_name]:.4f}, AUC={ {'logit': auc_logit, 'lgbm': auc_lgbm, 'catboost': auc_catb}[best_name]:.4f})")
 
-        # ----------------- Calibrate the chosen model on inner split -----------------
-        pv_in = None
-        if best_name == "logit":
-            pv_in = best_model.predict_proba(Xval_is)[:, 1]
-        elif best_name == "lgbm":
-            pv_in = best_model.predict(Xval_i, num_iteration=getattr(best_model, "best_iteration", None))
+        # ----------------- Calibrate the chosen model on the inner split -----------------
+        # If the best model is None (all models failed), we skip calibration and
+        # simply propagate the uncalibrated outer predictions (which will be
+        # constant 0.5) as the calibrated probabilities.
+        if best_model is None:
+            pv_va_cal = pv_va  # constant default
         else:
-            pv_in = best_model.predict_proba(Xval_i)[:, 1]
+            # Compute inner validation probabilities for the selected model.
+            if best_name == "logit":
+                pv_in = best_model.predict_proba(Xval_is)[:, 1]
+            elif best_name == "lgbm":
+                pv_in = best_model.predict(Xval_i, num_iteration=getattr(best_model, "best_iteration", None))
+            else:
+                pv_in = best_model.predict_proba(Xval_i)[:, 1]
 
-        # Fit calibration on inner validation predictions
-        if calib_method == "isotonic":
-            calib_f = fit_isotonic(yval_i, pv_in, sample_weight=wval_i)
-        elif calib_method == "platt":
-            calib_f = fit_platt(yval_i, pv_in, sample_weight=wval_i)
-        else:
-            calib_f = None
+            # Fit calibration on inner validation predictions
+            if calib_method == "isotonic":
+                calib_f = fit_isotonic(yval_i, pv_in, sample_weight=wval_i)
+            elif calib_method == "platt":
+                calib_f = fit_platt(yval_i, pv_in, sample_weight=wval_i)
+            else:
+                calib_f = None
 
-        # Apply calibration on outer validation predictions
-        if calib_f is not None:
-            # For isotonic regression, use transform; for Platt scaling (logistic regression),
-            # use predict_proba on the reshaped probabilities.  Otherwise, if calib_f
-            # is a callable, invoke it directly.  If anything fails, fall back to
-            # the uncalibrated probabilities.
-            try:
-                from sklearn.isotonic import IsotonicRegression
-                if isinstance(calib_f, IsotonicRegression):
-                    pv_va_cal = calib_f.transform(pv_va)
-                elif hasattr(calib_f, "predict_proba"):
-                    pv_va_cal = calib_f.predict_proba(pv_va.reshape(-1, 1))[:, 1]
-                elif callable(calib_f):
-                    pv_va_cal = calib_f(pv_va)
-                else:
+            # Apply calibration on outer validation predictions
+            if calib_f is not None:
+                # For isotonic regression, use transform; for Platt scaling (logistic regression),
+                # use predict_proba on the reshaped probabilities.  Otherwise, if calib_f
+                # is a callable, invoke it directly.  If anything fails, fall back to
+                # the uncalibrated probabilities.
+                try:
+                    from sklearn.isotonic import IsotonicRegression
+                    if isinstance(calib_f, IsotonicRegression):
+                        pv_va_cal = calib_f.transform(pv_va)
+                    elif hasattr(calib_f, "predict_proba"):
+                        pv_va_cal = calib_f.predict_proba(pv_va.reshape(-1, 1))[:, 1]
+                    elif callable(calib_f):
+                        pv_va_cal = calib_f(pv_va)
+                    else:
+                        pv_va_cal = pv_va
+                except Exception:
                     pv_va_cal = pv_va
-            except Exception:
+            else:
                 pv_va_cal = pv_va
-        else:
-            pv_va_cal = pv_va
 
         # Write out-of-fold probabilities
         oof_idx = np.where(mask)[0][va_idx]
