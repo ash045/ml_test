@@ -364,7 +364,13 @@ def train_oof_models(df: pd.DataFrame, cfg: Dict, artifact_dir: str) -> pd.DataF
     grid_catb = cfg["models"]["catboost"]
     calib_method = cfg["calibration"]["method"]
 
-    oof = pd.DataFrame(index=df.index, columns=["prob_long"])
+    # Initialise out-of-fold dataframe with prob_long and timestamp.  The timestamp
+    # column is required downstream for merging in training reports.
+    oof = pd.DataFrame(index=df.index, columns=["prob_long"])  # will hold calibrated probabilities
+    # Copy timestamp from full processed df; this ensures oof has the same order and
+    # that train_report can merge on timestamp without errors.
+    if "timestamp" in df.columns:
+        oof["timestamp"] = df["timestamp"].values
 
     # collect LGBM importances per fold
     imp_records = []
