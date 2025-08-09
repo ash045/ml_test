@@ -16,6 +16,7 @@ data:
   slippage_alpha: 0.5
   slippage_beta_trades: 0.5
   adv_window: 240
+  audit_raw: true
 
 bars:
   timeframes: ["1min","5min","15min","60min"]
@@ -51,12 +52,16 @@ labeling:
   use_uniqueness_weights: true
 
 validation:
-  outer_folds: 5          # rename from folds
-  inner_folds: 3          # add explicitly
-  min_train_size: 1000    # rename from min_train_bars; lower from 5000
+  outer_folds: 3          # rename from folds
+  inner_folds: 3    
+  min_val_size: 50         # add explicitly
+  min_train_size: 800    # rename from min_train_bars; lower from 5000
   embargo: 3              # replace minutes/"auto" with small # of bars
   final_test_fraction: 0  # give all data to CV while debugging
   debug_splits: true      # to verify split sizes in logs
+  #splitter: fixed   # or "fixed" | "expanding"
+  splitter_outer: fixed
+  splitter_inner: expanding
 
 models:
   logit:
