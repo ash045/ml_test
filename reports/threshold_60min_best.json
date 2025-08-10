@@ -1,0 +1,106 @@
+{
+  "ret_col": "ev_ret_240",
+  "holdout_frac": 0.8,
+  "apply_execution_mapping": true,
+  "combine_mode": "union",
+  "constraints": {
+    "min_trades_train": 100,
+    "min_trades_holdout": 5
+  },
+  "train_best": {
+    "t_long": 0.005,
+    "t_short": 0.005,
+    "total_return": -2.258596778274775,
+    "trades": 20919,
+    "avg_per_trade": -0.00010796867815262561,
+    "max_drawdown": -13.344791404709126,
+    "used_mapper": true,
+    "diag": {
+      "base": {
+        "long": 14679,
+        "short": 6240,
+        "trades": 20919
+      },
+      "mapper": {
+        "long": 943,
+        "short": 10324,
+        "trades": 11267
+      },
+      "combo": {
+        "long": 14679,
+        "short": 6240,
+        "trades": 20919
+      },
+      "combine_mode": "union"
+    }
+  },
+  "holdout_at_train_best": {
+    "t_long": 0.005,
+    "t_short": 0.005,
+    "total_return": -0.05999999999999999,
+    "trades": 200,
+    "avg_per_trade": -0.0003,
+    "max_drawdown": -0.05970000000000024,
+    "used_mapper": true,
+    "diag": {
+      "base": {
+        "long": 200,
+        "short": 0,
+        "trades": 200
+      },
+      "mapper": {
+        "long": 12,
+        "short": 95,
+        "trades": 107
+      },
+      "combo": {
+        "long": 200,
+        "short": 0,
+        "trades": 200
+      },
+      "combine_mode": "union"
+    }
+  },
+  "best_on_holdout_among_top_train": {
+    "t_long": 0.445,
+    "t_short": 0.38,
+    "total_return": -0.0537,
+    "trades": 179,
+    "avg_per_trade": -0.0003,
+    "max_drawdown": -0.053700000000000206,
+    "equity": null,
+    "used_mapper": true,
+    "diag": {
+      "base": {
+        "long": 56,
+        "short": 109,
+        "trades": 165
+      },
+      "mapper": {
+        "long": 12,
+        "short": 95,
+        "trades": 107
+      },
+      "combo": {
+        "long": 56,
+        "short": 123,
+        "trades": 179
+      },
+      "combine_mode": "union"
+    }
+  },
+  "train": {
+    "t_long": 0.005,
+    "t_short": 0.005
+  },
+  "best": {
+    "t_long": 0.005,
+    "t_short": 0.005
+  },
+  "artifacts": {
+    "grid_train_csv": "reports\\threshold_60min_grid_train.csv",
+    "heatmap_train_png": "reports\\threshold_60min_heatmap_train.png",
+    "top10_train_csv": "reports\\threshold_60min_top10_train.csv",
+    "equity_holdout_png": "reports\\threshold_60min_equity_holdout.png"
+  }
+}

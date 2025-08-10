@@ -105,7 +105,7 @@ ensemble:
 execution:
   tp_sigma_mult: "use_k_from_label"
   cost_margin_mult: 2.0
-  ret_col: ev_ret_240
+  ret_col: ev_ret_60
   fee_bps: 2.0
   spread_bps: 1.0
   slippage_alpha: 0.5
