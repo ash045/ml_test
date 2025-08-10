@@ -1,0 +1,26 @@
+{
+  "mode": "event",
+  "symbol": "SOL_USD",
+  "timeframe": "30min",
+  "eval_slice": "all",
+  "thresholds": {
+    "t_long": 0.6,
+    "t_short": 0.4,
+    "source": "config:signals"
+  },
+  "ret_col": "ev_ret_90",
+  "fees": {
+    "fee_bps": 2.0,
+    "spread_bps": 1.0
+  },
+  "metrics": {
+    "total_return": -0.04298257627140514,
+    "trades": 64,
+    "avg_per_trade": -0.000671602754240705,
+    "max_drawdown": -0.25415160221916794
+  },
+  "artifacts": {
+    "equity_png": "reports\\backtest_30min_event_all_equity.png",
+    "actions_csv": "reports\\backtest_30min_event_all_actions.csv"
+  }
+}

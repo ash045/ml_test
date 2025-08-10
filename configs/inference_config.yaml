@@ -16,10 +16,10 @@ killswitch:
 # cost model used to convert model scores into expected value (EV)
 costs:
   execution_mode: "taker"   # maker|taker
-  maker_fee_bps: 1.0
-  taker_fee_bps: 4.0
-  spread_bps: 2.0
-  slippage_bps_sqrt: 0.5
+  maker_fee_bps: 10.0
+  taker_fee_bps: 40.0
+  spread_bps: 20.0
+  slippage_bps_sqrt: 5.
 
 # risk management settings used by the position sizer
 risk:
@@ -30,11 +30,11 @@ risk:
 
 # policy thresholds controlling entry/exit, persistence and hysteresis
 policy:
-  entry_ev_bps: 3.0
-  exit_ev_bps: 1.0
+  entry_ev_bps: 250.0
+  exit_ev_bps: 100.0
   persistence_bars: 3
   cooldown_bars: 2
-  hysteresis_bps: 1.0
+  hysteresis_bps: 50.0
 
 # input data assumptions for realtime inference
 data:

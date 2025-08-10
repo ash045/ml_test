@@ -28,15 +28,15 @@ bars:
 
 features:
   windows:
-    returns: [1, 5, 15, 30, 60, 90]
-    vol:     [15, 30, 60, 90, 240]
-    trades:  [15, 30, 60, 90, 240]
+    returns: [1, 5, 15, 30, 60, 90, 240, 1440]
+    vol:     [15, 30, 60, 90, 240, 1440]
+    trades:  [15, 30, 60, 90, 240, 1440]
   fractional_diff:
     enabled: true
     d_candidates: [0.2, 0.4]
     stationarity_test: "adf"
   denoise:
-    ema_windows: [3, 5, 15]
+    ema_windows: [3, 5, 15, 30, 60]
   prune:
     corr_threshold: 0.95
 
@@ -45,7 +45,7 @@ signals:
   short_prob: 0.40
 
 labeling:
-  horizon_minutes: [30, 60, 90]
+  horizon_minutes: [30, 60, 90, 240, 1440]
   k_sigma: [1.0, 1.5, 2.0]
   sigma_window: 240
   neutral_label: 0
@@ -105,7 +105,7 @@ ensemble:
 execution:
   tp_sigma_mult: "use_k_from_label"
   cost_margin_mult: 2.0
-  ret_col: ev_ret_90
+  ret_col: ev_ret_240
   fee_bps: 2.0
   spread_bps: 1.0
   slippage_alpha: 0.5

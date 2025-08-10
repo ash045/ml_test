@@ -1,0 +1,4 @@
+{
+  "error": "no_thresholds_passed_min_trade_constraint",
+  "min_trades_train": 100
+}
