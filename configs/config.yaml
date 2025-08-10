@@ -19,7 +19,7 @@ data:
   audit_raw: true
 
 bars:
-  timeframes: ["1min","5min","15min","60min"]
+  timeframes: ["1min","5min","15min","60min","90min","240min","1440min"]
   info_bars:
     enabled: false
     dollar_threshold: 1000000.0

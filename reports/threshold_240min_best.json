@@ -1,4 +1,106 @@
 {
-  "error": "no_thresholds_passed_min_trade_constraint",
-  "min_trades_train": 100
+  "ret_col": "ev_ret_240",
+  "holdout_frac": 0.8,
+  "apply_execution_mapping": true,
+  "combine_mode": "union",
+  "constraints": {
+    "min_trades_train": 100,
+    "min_trades_holdout": 5
+  },
+  "train_best": {
+    "t_long": 0.785,
+    "t_short": 0.75,
+    "total_return": 6.896150149467593,
+    "trades": 4234,
+    "avg_per_trade": 0.0016287553494255065,
+    "max_drawdown": -4.9401797434284225,
+    "used_mapper": true,
+    "diag": {
+      "base": {
+        "long": 354,
+        "short": 3804,
+        "trades": 4158
+      },
+      "mapper": {
+        "long": 872,
+        "short": 1541,
+        "trades": 2413
+      },
+      "combo": {
+        "long": 430,
+        "short": 3804,
+        "trades": 4234
+      },
+      "combine_mode": "union"
+    }
+  },
+  "holdout_at_train_best": {
+    "t_long": 0.785,
+    "t_short": 0.75,
+    "total_return": -0.05999999999999999,
+    "trades": 200,
+    "avg_per_trade": -0.0003,
+    "max_drawdown": -0.05970000000000024,
+    "used_mapper": true,
+    "diag": {
+      "base": {
+        "long": 0,
+        "short": 200,
+        "trades": 200
+      },
+      "mapper": {
+        "long": 0,
+        "short": 184,
+        "trades": 184
+      },
+      "combo": {
+        "long": 0,
+        "short": 200,
+        "trades": 200
+      },
+      "combine_mode": "union"
+    }
+  },
+  "best_on_holdout_among_top_train": {
+    "t_long": 0.785,
+    "t_short": 0.75,
+    "total_return": -0.05999999999999999,
+    "trades": 200,
+    "avg_per_trade": -0.0003,
+    "max_drawdown": -0.05970000000000024,
+    "equity": null,
+    "used_mapper": true,
+    "diag": {
+      "base": {
+        "long": 0,
+        "short": 200,
+        "trades": 200
+      },
+      "mapper": {
+        "long": 0,
+        "short": 184,
+        "trades": 184
+      },
+      "combo": {
+        "long": 0,
+        "short": 200,
+        "trades": 200
+      },
+      "combine_mode": "union"
+    }
+  },
+  "train": {
+    "t_long": 0.785,
+    "t_short": 0.75
+  },
+  "best": {
+    "t_long": 0.785,
+    "t_short": 0.75
+  },
+  "artifacts": {
+    "grid_train_csv": "reports\\threshold_240min_grid_train.csv",
+    "heatmap_train_png": "reports\\threshold_240min_heatmap_train.png",
+    "top10_train_csv": "reports\\threshold_240min_top10_train.csv",
+    "equity_holdout_png": "reports\\threshold_240min_equity_holdout.png"
+  }
 }

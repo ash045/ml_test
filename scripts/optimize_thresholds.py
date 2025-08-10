@@ -7,21 +7,29 @@ slice.  A holdout slice is used to evaluate performance at the
 selected thresholds and to search for a more robust pair among the
 top‑ranking candidates.
 
-The optimisation can be run for different bar timeframes and
-return horizons by specifying ``--timeframe`` and ``--horizon``
-arguments.  The timeframe determines which processed feature/return
-file to load (e.g. ``240min``), while the horizon controls which
-realised return column (e.g. ``ret_60``) is used.  If no horizon is
-provided, the first entry in ``labeling.horizon_minutes`` from the
-config is used.
+This version enhances the original optimiser with the following features:
+
+* **Timeframe‑specific OOF probabilities** – the training pipeline writes one
+  ``oof_probs_{timeframe}.csv`` file per bar timeframe.  The optimiser now
+  automatically loads the file corresponding to ``--timeframe``.  If it is
+  missing, it falls back to ``oof_probs.csv`` and warns the user.  This
+  prevents mismatched merges that previously resulted in only a handful of
+  aligned events.
+* **Return horizon override** – specify ``--horizon <minutes>`` to override
+  the default realised return column.  If omitted, the first value in
+  ``labeling.horizon_minutes`` from the config is used.  The optimiser will
+  compute the return column on the fly from ``close`` prices if it is
+  missing.
+* **Graceful handling of empty grids** – if no threshold pairs meet the
+  minimum trade constraint on the training slice, the script now writes an
+  informative JSON summary instead of raising an exception.
 
 Example usage:
 
     python scripts/optimize_thresholds.py --config configs/config.yaml \
         --timeframe 240min --horizon 60
 
-Outputs are written into ``report_dir`` with filenames based on the
-timeframe.
+Outputs are written into ``report_dir`` with filenames based on the timeframe.
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -83,18 +91,23 @@ def _ensure_ret_col(df: pd.DataFrame, cfg: Dict[str, Any], horizon: Optional[int
     else:
         H_list = cfg.get("labeling", {}).get("horizon_minutes", [])
         if not H_list:
-            raise KeyError("No horizon_minutes specified in config and no horizon argument provided")
+            raise KeyError(
+                "No horizon_minutes specified in config and no horizon argument provided"
+            )
         H = int(H_list[0])
     cand = f"ret_{H}"
     if cand not in df.columns:
         # compute on the fly using close prices
         if "close" not in df.columns:
-            raise ValueError("No return column found and 'close' missing for on-the-fly computation.")
+            raise ValueError(
+                "No return column found and 'close' missing for on-the-fly computation."
+            )
         df[cand] = df["close"].shift(-H) / df["close"] - 1.0
     return cand
 
 
-def _equity_and_dd(returns: np.ndarray) -> tuple[np.ndarray, float]:
+def _equity_and_dd(returns: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Compute equity curve and maximum drawdown from returns."""
     eq = np.cumsum(returns)
     if len(eq):
         peak = np.maximum.accumulate(eq)
@@ -107,6 +120,7 @@ def _equity_and_dd(returns: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def _combine_actions(base: np.ndarray, mapped: np.ndarray, mode: str = "intersect") -> np.ndarray:
+    """Combine threshold-based and mapped actions according to the given mode."""
     base = base.astype(int)
     mapped = mapped.astype(int)
     if mode == "threshold_only":
@@ -115,7 +129,7 @@ def _combine_actions(base: np.ndarray, mapped: np.ndarray, mode: str = "intersec
         return mapped
     if mode == "union":
         out = base.copy()
-        mask = (out == 0)
+        mask = base == 0
         out[mask] = mapped[mask]
         return out
     # default: intersect — require same non-zero sign
@@ -128,6 +142,7 @@ def _combine_actions(base: np.ndarray, mapped: np.ndarray, mode: str = "intersec
 def _build_hysteresis(cfg: Dict[str, Any]) -> Dict[str, Any]:
     hyst_cfg = cfg.get("execution", {}).get("hysteresis", {})
     if not isinstance(hyst_cfg, dict):
+        # allow hyst_cfg to be scalar indicating cooldown minutes
         hyst_cfg = {
             "persistence_bars": 2,
             "cooldown_minutes": int(hyst_cfg) if hyst_cfg else 15,
@@ -138,8 +153,18 @@ def _build_hysteresis(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _maybe_apply_mapper(df: pd.DataFrame, cfg: Dict[str, Any], base_action: np.ndarray) -> tuple[np.ndarray, bool, Optional[Dict[str, Any]]]:
+def _maybe_apply_mapper(
+    df: pd.DataFrame,
+    cfg: Dict[str, Any],
+    base_action: np.ndarray,
+) -> Tuple[np.ndarray, bool, Optional[Dict[str, Any]]]:
+    """
+    Optionally apply EV-to-action mapping (execution mapping) to the data.
+
+    Returns a tuple of (combined_action, used_mapper, diagnostics).
+    """
     combine_mode = cfg.get("execution", {}).get("mapper_combine", "intersect")
+    # mapping requires sigma column
     if "sigma" not in df.columns:
         return base_action, False, None
     try:
@@ -154,7 +179,6 @@ def _maybe_apply_mapper(df: pd.DataFrame, cfg: Dict[str, Any], base_action: np.n
         k = float(cfg.get("labeling", {}).get("k_sigma", [2.0])[0])
         liq_gate = cfg.get("execution", {}).get("liquidity_gate", None)
         part_caps = cfg.get("execution", {}).get("participation_caps", None)
-
         df_map = map_probs_to_actions(
             df.copy(),
             "prob_long",
@@ -166,27 +190,19 @@ def _maybe_apply_mapper(df: pd.DataFrame, cfg: Dict[str, Any], base_action: np.n
             hyst,
             liquidity_gate=liq_gate,
             participation_caps=part_caps,
-        )  # returns columns: action_raw, action, ev_bps
+        )
         mapped = df_map["action"].values.astype(int)
         combined = _combine_actions(base_action, mapped, mode=combine_mode)
-
-        # diagnostics
+        # diagnostics: counts of long/short/trades for base/mapper/combined
+        def _diag_counts(a: np.ndarray) -> Dict[str, int]:
+            l = int((a == 1).sum())
+            s = int((a == -1).sum())
+            t = int((a != 0).sum())
+            return {"long": l, "short": s, "trades": t}
         diag = {
-            "base": {
-                "long": int((base_action == 1).sum()),
-                "short": int((base_action == -1).sum()),
-                "trades": int((base_action != 0).sum()),
-            },
-            "mapper": {
-                "long": int((mapped == 1).sum()),
-                "short": int((mapped == -1).sum()),
-                "trades": int((mapped != 0).sum()),
-            },
-            "combo": {
-                "long": int((combined == 1).sum()),
-                "short": int((combined == -1).sum()),
-                "trades": int((combined != 0).sum()),
-            },
+            "base": _diag_counts(base_action),
+            "mapper": _diag_counts(mapped),
+            "combo": _diag_counts(combined),
             "combine_mode": combine_mode,
         }
         return combined, True, diag
@@ -195,7 +211,7 @@ def _maybe_apply_mapper(df: pd.DataFrame, cfg: Dict[str, Any], base_action: np.n
 
 
 def _evaluate_thresholds(
-    data: pd.DataFrame,
+    df: pd.DataFrame,
     ret_col: str,
     fee_bps: float,
     spread_bps: float,
@@ -205,99 +221,97 @@ def _evaluate_thresholds(
     cfg: Dict[str, Any],
     return_equity: bool = False,
 ) -> Dict[str, Any]:
-    p = data["prob_long"].values.astype(float)
-    r = data[ret_col].values.astype(float)
-
-    base = np.zeros_like(p, dtype=int)
-    base[p >= t_long] = 1
-    base[p <= t_short] = -1
-
-    diag = None
+    """Evaluate a pair of long/short thresholds on a slice of data."""
+    # raw threshold-based action
+    prob = df["prob_long"]
+    a = np.zeros(len(prob), dtype=int)
+    a[prob >= t_long] = 1
+    a[prob <= t_short] = -1
+    used_mapper = False
+    diag: Optional[Dict[str, Any]] = None
     if apply_mapping:
-        a, used_mapper, diag = _maybe_apply_mapper(data, cfg, base)
-    else:
-        a, used_mapper = base, False
-
+        a, used_mapper, diag = _maybe_apply_mapper(df, cfg, a)
+    # returns
+    r = df[ret_col].astype(float).values
     trades = (a != 0).astype(float)
-    cost_bps = float(fee_bps) + float(spread_bps)
+    cost_bps = fee_bps + spread_bps
     net = a * r - cost_bps / 1e4 * trades
-
-    tot = float(np.nansum(net))
-    n_trades = int(trades.sum())
-    avg = float(np.nanmean(net[trades.astype(bool)])) if n_trades > 0 else 0.0
-    eq, mdd = _equity_and_dd(net) if return_equity else (np.array([]), 0.0)
-
-    out: Dict[str, Any] = {
+    total = float(np.nansum(net))
+    trade_count = int(trades.sum())
+    avg = float(np.nanmean(net[trades.astype(bool)])) if trade_count > 0 else 0.0
+    eq = []
+    if return_equity:
+        eq, mdd = _equity_and_dd(net)
+    else:
+        _, mdd = _equity_and_dd(net)
+    return {
         "t_long": float(t_long),
         "t_short": float(t_short),
-        "total_return": tot,
-        "trades": n_trades,
+        "total_return": total,
+        "trades": trade_count,
         "avg_per_trade": avg,
-        "max_drawdown": float(mdd),
-        "used_mapper": bool(used_mapper),
+        "max_drawdown": mdd,
+        "equity": eq if return_equity else None,
+        "used_mapper": used_mapper,
         "diag": diag,
     }
-    if return_equity:
-        out["equity"] = eq.tolist()
-    return out
 
 
 def _grid_search(
-    train_df: pd.DataFrame,
+    df: pd.DataFrame,
     ret_col: str,
     fee_bps: float,
     spread_bps: float,
     apply_mapping: bool,
     cfg: Dict[str, Any],
     min_trades_train: int,
-) -> tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
-    longs = np.linspace(0.60, 0.95, 15)
-    shorts = np.linspace(0.05, 0.40, 15)
+) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
+    """Perform a grid search over (long_prob, short_prob) pairs.
 
-    rows: list[Dict[str, Any]] = []
-    best: Optional[Dict[str, Any]] = None
-    for tL in longs:
-        for tS in shorts:
-            if not (tS < 0.5 < tL):
+    Returns the full results table and the best row (dict) or (empty, None)
+    if no candidate meets the ``min_trades_train`` constraint.
+    """
+    rows = []
+    # coarse grid (0.5% steps)
+    grid = np.linspace(0.0, 1.0, 201)
+    for tL in grid:
+        for tS in grid:
+            if tS > tL:  # require t_short <= t_long
                 continue
             res = _evaluate_thresholds(
-                train_df,
+                df,
                 ret_col,
                 fee_bps,
                 spread_bps,
-                float(tL),
-                float(tS),
+                tL,
+                tS,
                 apply_mapping,
                 cfg,
                 return_equity=False,
             )
-            if res["trades"] < int(min_trades_train):
-                continue
-            rows.append(res)
-            if best is None or res["total_return"] > best["total_return"]:
-                best = res
-
-    # If no rows were produced, return an empty DataFrame and None
+            if res["trades"] >= min_trades_train:
+                rows.append(res)
     if not rows:
+        # no candidates met the constraint
         return pd.DataFrame(), None
-    # Otherwise construct a DataFrame and sort by total_return
     table = pd.DataFrame(rows).sort_values("total_return", ascending=False).reset_index(drop=True)
+    best = table.iloc[0].to_dict()
     return table, best
 
 
-def _plot_heatmap(train_table: pd.DataFrame, path_png: str) -> None:
-    if train_table.empty:
+def _plot_heatmap(df: pd.DataFrame, path_png: str) -> None:
+    """Plot heatmap of total return over the threshold grid (TRAIN slice)."""
+    if df.empty:
         return
-    piv = train_table.pivot(index="t_short", columns="t_long", values="total_return")
-    plt.figure(figsize=(8, 6))
-    im = plt.imshow(piv.values, aspect="auto", origin="lower")
-    plt.colorbar(im, label="Total return (train)")
-    xticks = np.linspace(0, piv.shape[1] - 1, num=min(10, piv.shape[1]), dtype=int)
-    yticks = np.linspace(0, piv.shape[0] - 1, num=min(10, piv.shape[0]), dtype=int)
-    plt.xticks(xticks, [f"{v:.2f}" for v in piv.columns.values[xticks]])
-    plt.yticks(yticks, [f"{v:.2f}" for v in piv.index.values[yticks]])
-    plt.xlabel("t_long")
-    plt.ylabel("t_short")
+    # pivot by t_long (rows) and t_short (cols)
+    piv = df.pivot(index="t_long", columns="t_short", values="total_return")
+    # sort axes ascending
+    piv = piv.sort_index(ascending=True).sort_index(axis=1, ascending=True)
+    plt.figure(figsize=(6, 5))
+    plt.imshow(piv, aspect="auto", origin="lower", interpolation="nearest")
+    plt.colorbar(label="Total return (TRAIN slice)")
+    plt.xlabel("t_short")
+    plt.ylabel("t_long")
     plt.title("OOF EV heatmap (TRAIN)")
     plt.tight_layout()
     plt.savefig(path_png, dpi=120)
@@ -305,16 +319,15 @@ def _plot_heatmap(train_table: pd.DataFrame, path_png: str) -> None:
 
 
 def _plot_equity(eq: np.ndarray, path_png: str, title: str) -> None:
+    """Plot an equity curve."""
     if eq.size == 0:
         return
     plt.figure(figsize=(8, 3.5))
     plt.plot(eq, lw=1.5)
-    plt.xlabel("Events (chronological)")
+    plt.xlabel("Events/Bars (chronological)")
     plt.ylabel("Cumulative return")
     plt.title(title)
-    plt.tight_layout()
-    plt.savefig(path_png, dpi=120)
-    plt.close()
+    plt.tight_layout(); plt.savefig(path_png, dpi=120); plt.close()
 
 
 # -----------------------------------------------------------------------------
@@ -326,7 +339,18 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
     sym = cfg["data"]["symbol"]
     # Determine the processed data file based on timeframe
     proc_path = os.path.join(cfg["data"]["processed_dir"], f"{sym}_{timeframe}_processed.csv")
-    oof_path = os.path.join(cfg["artifact_dir"], "oof_probs.csv")
+    # Determine the OOF probability file based on timeframe.  The training script
+    # writes "oof_probs_{timeframe}.csv" into artifact_dir.  If that file
+    # does not exist, fall back to the legacy filename for backwards
+    # compatibility and warn the user.
+    oof_tf_path = os.path.join(cfg["artifact_dir"], f"oof_probs_{timeframe}.csv")
+    if os.path.exists(oof_tf_path):
+        oof_path = oof_tf_path
+    else:
+        oof_path = os.path.join(cfg["artifact_dir"], "oof_probs.csv")
+        log.warning(
+            f"Timeframe‑specific OOF file missing: {oof_tf_path}. Using fallback {oof_path}."
+        )
 
     # Load processed features and OOF probabilities
     df = pd.read_csv(proc_path)
@@ -355,6 +379,7 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
     # Holdout split / constraints / mapping toggle
     holdout_cfg = cfg.get("threshold_opt", {})
     frac = float(holdout_cfg.get("holdout_frac", 0.8))
+    # clamp fraction into [0.5, 0.95] and ensure at least 200 samples in holdout
     frac = min(max(frac, 0.5), 0.95)
     min_tr_train = int(holdout_cfg.get("min_trades_train", 100))
     min_tr_holdout = int(holdout_cfg.get("min_trades_holdout", 20))
@@ -385,6 +410,7 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
     base = os.path.join(cfg["report_dir"], f"threshold_{timeframe}")
 
     if best_train is None or train_table.empty:
+        # No viable thresholds found; write minimal summary and return
         train_table.to_csv(f"{base}_grid_train.csv", index=False)
         with open(f"{base}_best.json", "w", encoding="utf-8") as f:
             json.dump(
@@ -404,8 +430,8 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
         ret_col,
         fee_bps,
         spread_bps,
-        best_train["t_long"],
-        best_train["t_short"],
+        float(best_train["t_long"]),
+        float(best_train["t_short"]),
         apply_mapping,
         cfg,
         return_equity=True,
@@ -421,8 +447,8 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
             ret_col,
             fee_bps,
             spread_bps,
-            row["t_long"],
-            row["t_short"],
+            float(row["t_long"]),
+            float(row["t_short"]),
             apply_mapping,
             cfg,
             return_equity=False,
@@ -444,20 +470,24 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
     # HOLDOUT equity of train-best
     eq = np.array(best_on_hold.get("equity", []), dtype=float)
     eq_png = f"{base}_equity_holdout.png"
-    _plot_equity(eq, eq_png, title=f"Holdout equity | tL={best_train['t_long']:.3f}, tS={best_train['t_short']:.3f}")
+    _plot_equity(
+        eq,
+        eq_png,
+        title=f"Holdout equity | tL={best_train['t_long']:.3f}, tS={best_train['t_short']:.3f}",
+    )
 
     # --- DIAGNOSTICS: print action counts ---
     def _fmt_diag(dg: Optional[Dict[str, Any]]) -> str:
         if not dg:
             return "n/a"
-        b = dg["base"]
-        m = dg["mapper"]
-        c = dg["combo"]
+        b = dg.get("base", {})
+        m = dg.get("mapper", {})
+        c = dg.get("combo", {})
         return (
-            f"base L/S/T={b['long']}/{b['short']}/{b['trades']} | "
-            f"mapper L/S/T={m['long']}/{m['short']}/{m['trades']} | "
-            f"combo L/S/T={c['long']}/{c['short']}/{c['trades']} | "
-            f"mode={dg['combine_mode']}"
+            f"base L/S/T={b.get('long',0)}/{b.get('short',0)}/{b.get('trades',0)} | "
+            f"mapper L/S/T={m.get('long',0)}/{m.get('short',0)}/{m.get('trades',0)} | "
+            f"combo L/S/T={c.get('long',0)}/{c.get('short',0)}/{c.get('trades',0)} | "
+            f"mode={dg.get('combine_mode','intersect')}"
         )
 
     log.info("TRAIN diag @ train-best → " + _fmt_diag(best_train.get("diag")))
@@ -483,12 +513,14 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
             {k: _flt(v) for k, v in best_holdout.items()} if best_holdout else None
         ),
         # --- compatibility for old loaders ---
-        "train": {"t_long": float(best_train["t_long"]), "t_short": float(best_train["t_short"])}
-        if best_train
-        else None,
-        "best": {"t_long": float(best_train["t_long"]), "t_short": float(best_train["t_short"])}
-        if best_train
-        else None,
+        "train": {
+            "t_long": float(best_train["t_long"]),
+            "t_short": float(best_train["t_short"]),
+        },
+        "best": {
+            "t_long": float(best_train["t_long"]),
+            "t_short": float(best_train["t_short"]),
+        },
         "artifacts": {
             "grid_train_csv": grid_csv,
             "heatmap_train_png": heatmap_png,
@@ -513,7 +545,7 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
     )
     if best_holdout:
         log.info(
-            f"Best-on-HOLDOUT among top {min(50, len(train_table))}: "
+            f"Best-on-HOLDOUT among top {topK}: "
             f"tL={best_holdout['t_long']:.3f}, tS={best_holdout['t_short']:.3f}, "
             f"trades={best_holdout['trades']}, total_return={best_holdout['total_return']:.6f}"
         )
@@ -523,12 +555,14 @@ def main(cfg_path: str, timeframe: str = "1min", horizon: Optional[int] = None) 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Optimise long/short probability thresholds via grid search")
+    parser = argparse.ArgumentParser(
+        description="Optimise long/short probability thresholds via grid search"
+    )
     parser.add_argument("--config", required=True, help="Path to training configuration YAML")
     parser.add_argument(
         "--timeframe",
         default="1min",
-        help="Bar timeframe to use (e.g. 1min, 5min, 240min). Determines which processed data file is read.",
+        help="Bar timeframe to use (e.g. 1min, 5min, 240min). Determines which processed data file and OOF probabilities are read.",
     )
     parser.add_argument(
         "--horizon",
