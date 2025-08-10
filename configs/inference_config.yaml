@@ -1,0 +1,56 @@
+symbol: "SOL-USD"
+monitoring_path: "./monitoring/events.jsonl"
+# the number of bars required before producing predictions
+warmup_bars: 240
+
+# location for saving/reading trained models and other artifacts
+registry:
+  root: "./artifacts"
+
+# a simple file‑based kill switch. when the file exists the engine
+# will liquidate positions and cease trading
+killswitch:
+  enabled: true
+  file_path: "./killswitch.enabled"
+
+# cost model used to convert model scores into expected value (EV)
+costs:
+  execution_mode: "taker"   # maker|taker
+  maker_fee_bps: 1.0
+  taker_fee_bps: 4.0
+  spread_bps: 2.0
+  slippage_bps_sqrt: 0.5
+
+# risk management settings used by the position sizer
+risk:
+  vol_target_annual: 0.25
+  max_gross_leverage: 2.0
+  adv_participation_cap: 0.15
+  position_unit: "units"     # units|usd
+
+# policy thresholds controlling entry/exit, persistence and hysteresis
+policy:
+  entry_ev_bps: 3.0
+  exit_ev_bps: 1.0
+  persistence_bars: 3
+  cooldown_bars: 2
+  hysteresis_bps: 1.0
+
+# input data assumptions for realtime inference
+data:
+  timeframe: "15min"          # resample for consistency
+  timestamp_col: "timestamp"
+  price_col: "close"
+
+# feature generation settings for the realtime pipeline
+features:
+  ema_windows: [3, 5]
+  fractional_diff:
+    enabled: false
+    d: 0.40
+  context_bars: 300          # number of bars kept in memory for causal features
+
+# default runtime parameters, can be overridden via CLI
+runtime:
+  csv_path: "./data/SOL_USD.csv"
+  out_path: "./out/inference_events.csv"

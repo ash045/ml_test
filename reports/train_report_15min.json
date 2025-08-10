@@ -1,9 +1,9 @@
 {
-  "n_samples": 1272,
-  "pos": 619,
-  "neg": 653,
-  "auc": 0.5137052698854833,
-  "brier": 0.2569908486276797,
+  "n_samples": 1472,
+  "pos": 725,
+  "neg": 747,
+  "auc": 0.5477686131022548,
+  "brier": 0.2770137107643391,
   "roc_plot": "reports\\roc_15min.png",
   "calibration_plot": "reports\\reliability_15min.png"
 }

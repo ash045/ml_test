@@ -1,0 +1,22 @@
+## Hyper‑parameters for the realtime ensemble and EV mapping
+
+ensemble:
+  # a list of models to include in the weighted ensemble. built‑ins are
+  # lightweight and require no training artifacts. additional models can
+  # be registered via the ArtifactRegistry and referenced by name here.
+  members:
+    - type: "builtin:ema_crossover"
+      fast: 12
+      slow: 48
+      normalize: true
+      weight: 1.0
+  # the final calibrator is applied to the ensemble score. by default
+  # this is identity (no calibration) because builtin models already map
+  # scores into a bounded range.
+  final_calibrator:
+    type: "builtin:identity"
+
+# conversion from raw model score to expected value (EV) in basis points
+ev:
+  ev_per_unit_score_bps: 10.0
+  cap_ev_bps: 50.0

@@ -10,9 +10,9 @@
   "train_best": {
     "t_long": 0.85,
     "t_short": 0.4,
-    "total_return": 0.22394469659921148,
-    "trades": 762,
-    "avg_per_trade": 0.0002938906779517211,
+    "total_return": 0.028193922075125645,
+    "trades": 353,
+    "avg_per_trade": 7.986946763491678e-05,
     "max_drawdown": 0.0,
     "used_mapper": true,
     "diag": {
@@ -22,14 +22,14 @@
         "trades": 237
       },
       "mapper": {
-        "long": 22,
-        "short": 602,
-        "trades": 624
+        "long": 17,
+        "short": 176,
+        "trades": 193
       },
       "combo": {
-        "long": 38,
-        "short": 724,
-        "trades": 762
+        "long": 36,
+        "short": 317,
+        "trades": 353
       },
       "combine_mode": "union"
     }
@@ -37,10 +37,10 @@
   "holdout_at_train_best": {
     "t_long": 0.85,
     "t_short": 0.4,
-    "total_return": -0.11828944988446627,
-    "trades": 69,
-    "avg_per_trade": -0.0017143398533980623,
-    "max_drawdown": -0.13709208450776147,
+    "total_return": -0.04087186360997069,
+    "trades": 58,
+    "avg_per_trade": -0.0007046873036201845,
+    "max_drawdown": -0.0693170107420319,
     "used_mapper": true,
     "diag": {
       "base": {
@@ -50,40 +50,40 @@
       },
       "mapper": {
         "long": 0,
-        "short": 52,
-        "trades": 52
+        "short": 41,
+        "trades": 41
       },
       "combo": {
         "long": 0,
-        "short": 69,
-        "trades": 69
+        "short": 58,
+        "trades": 58
       },
       "combine_mode": "union"
     }
   },
   "best_on_holdout_among_top_train": {
-    "t_long": 0.85,
-    "t_short": 0.35000000000000003,
-    "total_return": -0.1143576803515654,
-    "trades": 52,
-    "avg_per_trade": -0.0021991861606070265,
+    "t_long": 0.8999999999999999,
+    "t_short": 0.4,
+    "total_return": -0.04087186360997069,
+    "trades": 58,
+    "avg_per_trade": -0.0007046873036201845,
     "max_drawdown": 0.0,
     "used_mapper": true,
     "diag": {
       "base": {
         "long": 0,
-        "short": 0,
-        "trades": 0
+        "short": 24,
+        "trades": 24
       },
       "mapper": {
         "long": 0,
-        "short": 52,
-        "trades": 52
+        "short": 41,
+        "trades": 41
       },
       "combo": {
         "long": 0,
-        "short": 52,
-        "trades": 52
+        "short": 58,
+        "trades": 58
       },
       "combine_mode": "union"
     }

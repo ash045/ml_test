@@ -14,10 +14,10 @@
     "spread_bps": 1.0
   },
   "metrics": {
-    "total_return": 0.1406148254946576,
-    "trades": 832,
-    "avg_per_trade": 0.00016900820371954032,
-    "max_drawdown": -0.2570893178466047
+    "total_return": -0.02465743960073527,
+    "trades": 412,
+    "avg_per_trade": -5.984815437071654e-05,
+    "max_drawdown": -0.18500408821016273
   },
   "artifacts": {
     "equity_png": "reports\\backtest_1min_event_all_equity.png",
